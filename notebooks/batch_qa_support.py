@@ -5,8 +5,10 @@ import hashlib
 import json
 import re
 import shutil
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -132,8 +134,52 @@ def retry(operation, retries: int, wait: float):
             time.sleep(wait)
 
 
+def pdf_password_candidates(primary: str | None = None, additional: str | None = None) -> list[str]:
+    candidates = [primary] if primary else []
+    if additional:
+        try:
+            parsed = json.loads(additional)
+        except ValueError:
+            parsed = additional
+        if isinstance(parsed, list):
+            if not all(isinstance(value, str) for value in parsed):
+                raise ValueError('PDF_PASSWORDS must contain only strings')
+            candidates.extend(parsed)
+        else:
+            candidates.append(additional)
+    return list(dict.fromkeys(value for value in candidates if value))
+
+
+class PDFPasswordError(ValueError):
+    pass
+
+
+@contextmanager
+def prepared_pdf(path: Path, passwords: list[str]):
+    from PyPDF2 import PdfReader, PdfWriter
+
+    with path.open('rb') as stream:
+        reader = PdfReader(stream)
+        if not reader.is_encrypted:
+            yield path
+            return
+        for password in dict.fromkeys(['', *passwords]):
+            if reader.decrypt(password):
+                break
+        else:
+            raise PDFPasswordError('Encrypted PDF could not be opened with the configured passwords')
+        with tempfile.TemporaryDirectory(prefix='pageindex_pdf_') as directory:
+            decrypted = Path(directory) / path.name
+            writer = PdfWriter()
+            writer.append(reader, import_outline=True)
+            with decrypted.open('wb') as output:
+                writer.write(output)
+            yield decrypted
+
+
 def ingest(client, pdf_dir: Path, work_dir: Path, mode: str, index_signature: Any, force: bool = False,
-           retries: int = 5, wait: float = 60.0) -> list[dict[str, Any]]:
+           retries: int = 5, wait: float = 60.0,
+           pdf_passwords: list[str] | None = None) -> list[dict[str, Any]]:
     if not pdf_dir.is_dir():
         raise FileNotFoundError(f'PDF_DIR does not exist: {pdf_dir}')
     manifest_path = work_dir / 'ingest_manifest.json'
@@ -161,15 +207,18 @@ def ingest(client, pdf_dir: Path, work_dir: Path, mode: str, index_signature: An
             if reusable:
                 row.update(doc_id=prior['doc_id'], name=prior.get('name', path.name), status='reused')
             else:
-                submitted = retry(lambda: client.submit_document(str(path), mode=mode), retries, wait)
+                with prepared_pdf(path, pdf_passwords or []) as submitted_path:
+                    submitted = retry(lambda: client.submit_document(str(submitted_path), mode=mode), retries, wait)
                 row.update(doc_id=submitted['doc_id'], name=submitted.get('name', path.name), status='indexed')
             current[source] = row
+        except PDFPasswordError as exc:
+            row.update(status='skipped_wrong_password', error=str(exc))
         except Exception as exc:
             row.update(status='error', error=str(exc))
         rows.append(row)
         write_json(manifest_path, current)
         write_json(work_dir / 'ingest_report.json', rows)
-        print(f"{source}: {row['status']}")
+        print(f"{source}: {row['status']}" + (f" ({row['error']})" if row.get('error') else ''))
     return [row for row in rows if row.get('doc_id')]
 
 

@@ -10,6 +10,8 @@ from unittest.mock import Mock
 
 import pytest
 
+from conftest import build_pdf
+
 MODULE_PATH = Path(__file__).resolve().parents[1] / 'notebooks' / 'batch_qa_support.py'
 spec = importlib.util.spec_from_file_location('batch_qa_support', MODULE_PATH)
 support = importlib.util.module_from_spec(spec)
@@ -34,14 +36,14 @@ def test_ingest_resume_requires_same_content_and_settings(tmp_path):
     pdf_dir = tmp_path / 'pdf'
     pdf_dir.mkdir()
     pdf = pdf_dir / 'report.pdf'
-    pdf.write_bytes(b'pdf-one')
+    pdf.write_bytes(build_pdf(['one']))
     client = Mock()
     client.submit_document.side_effect = [{'doc_id': 'one'}, {'doc_id': 'two'}, {'doc_id': 'three'}]
     client.is_retrieval_ready.return_value = True
     args = (client, pdf_dir, tmp_path / 'work', 'flash')
     assert support.ingest(*args, {'model': 'a'})[0]['status'] == 'indexed'
     assert support.ingest(*args, {'model': 'a'})[0]['status'] == 'reused'
-    pdf.write_bytes(b'pdf-two')
+    pdf.write_bytes(build_pdf(['two']))
     assert support.ingest(*args, {'model': 'a'})[0]['doc_id'] == 'two'
     assert support.ingest(*args, {'model': 'b'})[0]['doc_id'] == 'three'
     assert client.submit_document.call_count == 3
@@ -160,3 +162,119 @@ def test_failed_page_tool_is_attempted_but_never_recorded_as_read(monkeypatch):
     assert row['pages_attempted'] == ['report.pdf:99']
     assert row['pages_read'] == []
     assert len(row['tool_results']) == 1
+
+
+def encrypted_pdf(path, password):
+    from io import BytesIO
+    from PyPDF2 import PdfReader, PdfWriter
+
+    writer = PdfWriter()
+    writer.append(PdfReader(BytesIO(build_pdf(['Encrypted content']))))
+    writer.add_outline_item('Chapter', 0)
+    writer.encrypt(password, owner_password='owner-secret')
+    with path.open('wb') as stream:
+        writer.write(stream)
+
+
+@pytest.mark.parametrize('password', ['', ' spaced secret '])
+def test_ingest_decrypts_without_changing_source_and_preserves_outline(tmp_path, password):
+    from PyPDF2 import PdfReader
+    import pypdfium2
+
+    pdf_dir = tmp_path / 'pdf'
+    pdf_dir.mkdir()
+    original = pdf_dir / 'report.pdf'
+    encrypted_pdf(original, password)
+    original_bytes = original.read_bytes()
+    submitted_paths = []
+
+    def submit(path, mode):
+        submitted = Path(path)
+        submitted_paths.append(submitted)
+        assert submitted.name == original.name
+        reader = PdfReader(path)
+        assert not reader.is_encrypted
+        assert 'Encrypted content' in reader.pages[0].extract_text()
+        assert reader.outline[0]['/Title'] == 'Chapter'
+        with pypdfium2.PdfDocument(path) as document:
+            assert len(document) == 1
+        return {'doc_id': 'one', 'name': original.name}
+
+    client = Mock()
+    client.submit_document.side_effect = submit
+    client.is_retrieval_ready.return_value = True
+    args = (client, pdf_dir, tmp_path / 'work', 'flash', {})
+    assert support.ingest(*args, pdf_passwords=['bad', password])[0]['status'] == 'indexed'
+    assert original.read_bytes() == original_bytes
+    assert not submitted_paths[0].exists()
+    assert not submitted_paths[0].parent.exists()
+    assert support.ingest(*args, pdf_passwords=[])[0]['status'] == 'reused'
+    assert client.submit_document.call_count == 1
+
+
+def test_wrong_password_is_retried_and_batch_continues(tmp_path, capsys):
+    pdf_dir = tmp_path / 'pdf'
+    pdf_dir.mkdir()
+    encrypted_pdf(pdf_dir / 'a.pdf', ' secret ')
+    (pdf_dir / 'b.pdf').write_bytes(build_pdf(['Plain text']))
+    client = Mock()
+    client.submit_document.return_value = {'doc_id': 'plain'}
+    client.is_retrieval_ready.return_value = True
+    args = (client, pdf_dir, tmp_path / 'work', 'flash', {})
+    assert len(support.ingest(*args, pdf_passwords=['wrong-secret'])) == 1
+    report = json.loads((tmp_path / 'work' / 'ingest_report.json').read_text())
+    assert report[0]['status'] == 'skipped_wrong_password'
+    assert 'wrong-secret' not in json.dumps(report) + capsys.readouterr().out
+    client.submit_document.return_value = {'doc_id': 'encrypted'}
+    assert len(support.ingest(*args, pdf_passwords=[' secret '])) == 2
+    assert client.submit_document.call_count == 2
+
+
+def test_decrypted_temporary_file_cleaned_after_submit_error(tmp_path):
+    pdf_dir = tmp_path / 'pdf'
+    pdf_dir.mkdir()
+    encrypted_pdf(pdf_dir / 'report.pdf', 'secret')
+    submitted_paths = []
+
+    def submit(path, mode):
+        submitted_paths.append(Path(path))
+        raise RuntimeError('Indexing failed')
+
+    client = Mock()
+    client.submit_document.side_effect = submit
+    assert support.ingest(client, pdf_dir, tmp_path / 'work', 'flash', {}, pdf_passwords=['secret']) == []
+    assert not submitted_paths[0].parent.exists()
+
+
+def test_plain_pdf_is_submitted_directly(tmp_path):
+    path = tmp_path / 'plain.pdf'
+    path.write_bytes(build_pdf(['Plain content']))
+    with support.prepared_pdf(path, []) as prepared:
+        assert prepared == path
+    assert path.exists()
+
+
+def test_password_candidates_preserve_whitespace_and_primary_priority():
+    assert support.pdf_password_candidates(' primary ', '["second", " primary ", ""]') == [' primary ', 'second']
+    assert support.pdf_password_candidates(None, ' whole secret ') == [' whole secret ']
+    with pytest.raises(ValueError, match='only strings'):
+        support.pdf_password_candidates(None, '[123]')
+
+
+def test_aes_encrypted_pdf_can_be_prepared(tmp_path):
+    pypdf = pytest.importorskip('pypdf')
+    pytest.importorskip('Crypto')
+    from io import BytesIO
+    from PyPDF2 import PdfReader
+
+    writer = pypdf.PdfWriter()
+    writer.append(pypdf.PdfReader(BytesIO(build_pdf(['AES content']))))
+    writer.encrypt(' aes secret ', algorithm='AES-256')
+    path = tmp_path / 'aes.pdf'
+    with path.open('wb') as stream:
+        writer.write(stream)
+    with support.prepared_pdf(path, ['bad', ' aes secret ']) as prepared:
+        reader = PdfReader(prepared)
+        assert not reader.is_encrypted
+        assert 'AES content' in reader.pages[0].extract_text()
+    assert not prepared.parent.exists()
