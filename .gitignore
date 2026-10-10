@@ -7,3 +7,7 @@ logs/
 .pageindex/
 dist/
 /results/
+
+# Batch notebook configuration template and generated artifacts
+!.env.example
+/data/
